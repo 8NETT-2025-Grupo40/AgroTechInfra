@@ -3,14 +3,25 @@ name: Destroy EKS Cluster
 on:
   workflow_dispatch:
     inputs:
+      AWS_REGION:
+        description: 'AWS region (ex: us-east-1)'
+        type: string
+        required: true
+        default: 'us-east-1'
+      CLUSTER_NAME:
+        description: 'EKS cluster name'
+        type: string
+        required: true
+        default: 'agro-tech'
       confirm_destroy:
         description: 'Type "DESTROY" to confirm cluster deletion'
         required: true
         type: string
 
 env:
-  AWS_REGION: us-east-1
-  CLUSTER_NAME: agro-tech
+  AWS_REGION: ${{ inputs.AWS_REGION }}
+  CLUSTER_NAME: ${{ inputs.CLUSTER_NAME }}
+
 
 jobs:
   validate-input:
@@ -27,6 +38,20 @@ jobs:
             exit 1
           fi
           echo "Confirmation validated"
+
+      - name: Validate inputs
+        run: |
+          missing=false
+          for var in AWS_REGION CLUSTER_NAME; do
+            value=$(printenv "$var")
+            if [ -z "$value" ]; then
+              echo "Missing required input: $var"
+              missing=true
+            fi
+          done
+          if [ "$missing" = "true" ]; then
+            exit 1
+          fi
   
   destroy-cluster:
     name: Delete EKS Cluster and Resources
@@ -54,10 +79,11 @@ jobs:
       - name: Install Helm
         run: |
           curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-      
+
       - name: Update kubeconfig
         run: |
           aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
+
       
       # Remove todas as aplicações instaladas via Helm antes de deletar o cluster
       # Isso permite que recursos da AWS (ALBs, etc) sejam limpos adequadamente
@@ -94,8 +120,8 @@ jobs:
           echo "Waiting for ALBs to be deleted..."
           sleep 60
           
-          # Busca e deleta ALBs criados pelo cluster (começam com k8s-agro-tech)
-          aws elbv2 describe-load-balancers --region ${{ env.AWS_REGION }} --query "LoadBalancers[?contains(LoadBalancerName, 'k8s-agro-tech')].LoadBalancerArn" --output text | while read lb_arn; do
+          # Busca e deleta ALBs criados pelo cluster (começam com k8s-<cluster>)
+          aws elbv2 describe-load-balancers --region ${{ env.AWS_REGION }} --query "LoadBalancers[?contains(LoadBalancerName, 'k8s-${{ env.CLUSTER_NAME }}')].LoadBalancerArn" --output text | while read lb_arn; do
             if [ ! -z "$lb_arn" ]; then
               echo "Force deleting: $lb_arn"
               aws elbv2 delete-load-balancer --load-balancer-arn $lb_arn --region ${{ env.AWS_REGION }} || true
@@ -110,7 +136,7 @@ jobs:
       - name: Delete Target Groups
         run: |
           echo "Cleaning up target groups..."
-          aws elbv2 describe-target-groups --region ${{ env.AWS_REGION }} --query "TargetGroups[?contains(TargetGroupName, 'k8s-agro-tech')].TargetGroupArn" --output text | while read tg_arn; do
+          aws elbv2 describe-target-groups --region ${{ env.AWS_REGION }} --query "TargetGroups[?contains(TargetGroupName, 'k8s-${{ env.CLUSTER_NAME }}')].TargetGroupArn" --output text | while read tg_arn; do
             if [ ! -z "$tg_arn" ]; then
               echo "Deleting: $tg_arn"
               aws elbv2 delete-target-group --target-group-arn $tg_arn --region ${{ env.AWS_REGION }} || true
@@ -137,8 +163,8 @@ jobs:
           echo ""
           echo "NOT DELETED (manual cleanup if needed):"
           echo "   - IAM Policies (AWSLoadBalancerControllerIAMPolicy, AgroTechExternalSecretsPolicy, CloudWatchApplicationSignalsPolicy)"
-          echo "   - AWS Secrets Manager secrets (agro-tech-api-*)"
-          echo "   - VPC and networking (vpc-0e6d1df089da1ec39)"
+          echo "   - AWS Secrets Manager secrets (prefix definido por voce)"
+          echo "   - VPC and networking"
           echo "   - ECR repositories"
-          echo "   - CloudWatch Log Groups (/aws/application-signals/*, /aws/containerinsights/agro-tech/*)"
+          echo "   - CloudWatch Log Groups (/aws/application-signals/*, /aws/containerinsights/${CLUSTER_NAME}/*)"
           echo ""

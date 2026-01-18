@@ -3,6 +3,56 @@ name: Setup EKS Cluster & Add-ons
 on:
   workflow_dispatch:
     inputs:
+      AWS_REGION:
+        description: 'AWS region (ex: us-east-1)'
+        type: string
+        required: true
+        default: 'us-east-1'
+      CLUSTER_NAME:
+        description: 'EKS cluster name'
+        type: string
+        required: true
+        default: 'agro-tech'
+      VPC_ID:
+        description: 'Existing VPC ID'
+        type: string
+        required: true
+        default: 'vpc-0123456789abcdef0'
+      PUBLIC_SUBNET_IDS:
+        description: 'Public subnet IDs (comma-separated)'
+        type: string
+        required: true
+        default: 'subnet-0abc123456789def0,subnet-0def123456789abc0'
+      K8S_NAMESPACE:
+        description: 'Namespace principal para apps'
+        type: string
+        required: true
+        default: 'agro-tech'
+      SECRETS_PREFIX:
+        description: 'Prefixo dos secrets no Secrets Manager'
+        type: string
+        required: true
+        default: 'agro-tech'
+      NODE_INSTANCE_TYPE:
+        description: 'Node instance type'
+        type: string
+        required: true
+        default: 't3a.medium'
+      NODE_MIN:
+        description: 'Nodegroup minimum size'
+        type: string
+        required: true
+        default: '2'
+      NODE_DESIRED:
+        description: 'Nodegroup desired size'
+        type: string
+        required: true
+        default: '3'
+      NODE_MAX:
+        description: 'Nodegroup maximum size'
+        type: string
+        required: true
+        default: '10'
       skip_cluster:
         description: 'Skip cluster creation (cluster already exists)'
         type: boolean
@@ -13,9 +63,17 @@ on:
         default: false
 
 env:
-  AWS_REGION: us-east-1
-  CLUSTER_NAME: agro-tech
-  AWS_ACCOUNT_ID: 478511033947
+  AWS_REGION: ${{ inputs.AWS_REGION }}
+  CLUSTER_NAME: ${{ inputs.CLUSTER_NAME }}
+  VPC_ID: ${{ inputs.VPC_ID }}
+  PUBLIC_SUBNET_IDS: ${{ inputs.PUBLIC_SUBNET_IDS }}
+  K8S_NAMESPACE: ${{ inputs.K8S_NAMESPACE }}
+  SECRETS_PREFIX: ${{ inputs.SECRETS_PREFIX }}
+  NODE_INSTANCE_TYPE: ${{ inputs.NODE_INSTANCE_TYPE }}
+  NODE_MIN: ${{ inputs.NODE_MIN }}
+  NODE_DESIRED: ${{ inputs.NODE_DESIRED }}
+  NODE_MAX: ${{ inputs.NODE_MAX }}
+
 
 jobs:
   setup-cluster:
@@ -42,7 +100,119 @@ jobs:
           tar -xzf eksctl_Linux_amd64.tar.gz -C /tmp
           sudo mv /tmp/eksctl /usr/local/bin
           eksctl version
-      
+
+      - name: Validate inputs
+        run: |
+          missing=false
+          for var in AWS_REGION CLUSTER_NAME VPC_ID PUBLIC_SUBNET_IDS K8S_NAMESPACE SECRETS_PREFIX NODE_INSTANCE_TYPE NODE_MIN NODE_DESIRED NODE_MAX; do
+            value=$(printenv "$var")
+            if [ -z "$value" ]; then
+              echo "Missing required input: $var"
+              missing=true
+            fi
+          done
+          if [ "$missing" = "true" ]; then
+            exit 1
+          fi
+
+          if ! [[ "$NODE_MIN" =~ ^[0-9]+$ ]] || ! [[ "$NODE_DESIRED" =~ ^[0-9]+$ ]] || ! [[ "$NODE_MAX" =~ ^[0-9]+$ ]]; then
+            echo "NODE_MIN, NODE_DESIRED, NODE_MAX must be integers"
+            exit 1
+          fi
+
+          if [ "$NODE_MIN" -gt "$NODE_DESIRED" ] || [ "$NODE_DESIRED" -gt "$NODE_MAX" ]; then
+            echo "Invalid node sizing: ensure NODE_MIN <= NODE_DESIRED <= NODE_MAX"
+            exit 1
+          fi
+
+      - name: Resolve AWS account ID
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID" >> $GITHUB_ENV
+
+      - name: Generate cluster config
+        run: |
+          IFS=',' read -ra SUBNETS <<< "$PUBLIC_SUBNET_IDS"
+          CLEAN_SUBNETS=()
+          for subnet in "${SUBNETS[@]}"; do
+            trimmed=$(echo "$subnet" | xargs)
+            if [ -n "$trimmed" ]; then
+              CLEAN_SUBNETS+=("$trimmed")
+            fi
+          done
+
+          if [ ${#CLEAN_SUBNETS[@]} -lt 2 ]; then
+            echo "PUBLIC_SUBNET_IDS must include at least 2 subnets"
+            exit 1
+          fi
+
+          PUBLIC_SUBNETS_YAML=""
+          NODEGROUP_SUBNETS_YAML=""
+          declare -A AZ_MAP
+
+          SUBNET_INFO=$(aws ec2 describe-subnets \
+            --region "$AWS_REGION" \
+            --subnet-ids "${CLEAN_SUBNETS[@]}" \
+            --query 'Subnets[].{Id:SubnetId,Az:AvailabilityZone,Vpc:VpcId}' \
+            --output text)
+
+          if [ -z "$SUBNET_INFO" ]; then
+            echo "Unable to resolve subnet details"
+            exit 1
+          fi
+
+          while read -r subnet az vpc; do
+            if [ -z "$subnet" ] || [ -z "$az" ]; then
+              continue
+            fi
+            if [ "$vpc" != "$VPC_ID" ]; then
+              echo "Subnet $subnet is in VPC $vpc, expected $VPC_ID"
+              exit 1
+            fi
+            if [ -n "${AZ_MAP[$az]}" ]; then
+              echo "Duplicate subnet AZ detected: $az"
+              exit 1
+            fi
+            AZ_MAP[$az]=1
+            PUBLIC_SUBNETS_YAML+=$(printf "      %s:\n        id: %s\n" "$az" "$subnet")
+            NODEGROUP_SUBNETS_YAML+=$(printf "      - %s\n" "$subnet")
+          done <<< "$SUBNET_INFO"
+
+          if [ ${#AZ_MAP[@]} -lt 2 ]; then
+            echo "PUBLIC_SUBNET_IDS must span at least 2 availability zones"
+            exit 1
+          fi
+
+          export PUBLIC_SUBNETS_YAML NODEGROUP_SUBNETS_YAML
+
+
+          export AWS_REGION CLUSTER_NAME VPC_ID NODE_INSTANCE_TYPE NODE_MIN NODE_DESIRED NODE_MAX
+
+          template="eks/cluster-config.template.yaml"
+          output="eks/cluster-config.yaml"
+
+          sed -e "s|{{CLUSTER_NAME}}|$CLUSTER_NAME|g" \
+              -e "s|{{AWS_REGION}}|$AWS_REGION|g" \
+              -e "s|{{VPC_ID}}|$VPC_ID|g" \
+              -e "s|{{NODE_INSTANCE_TYPE}}|$NODE_INSTANCE_TYPE|g" \
+              -e "s|{{NODE_MIN}}|$NODE_MIN|g" \
+              -e "s|{{NODE_DESIRED}}|$NODE_DESIRED|g" \
+              -e "s|{{NODE_MAX}}|$NODE_MAX|g" \
+              "$template" > "$output"
+
+          perl -0pi -e "s|^\s*__PUBLIC_SUBNETS__|$ENV{PUBLIC_SUBNETS_YAML}|gm; s|^\s*__NODEGROUP_SUBNETS__|$ENV{NODEGROUP_SUBNETS_YAML}|gm" "$output"
+
+          if grep -q "__PUBLIC_SUBNETS__" "$output" || grep -q "__NODEGROUP_SUBNETS__" "$output"; then
+            echo "Failed to render subnet placeholders"
+            exit 1
+          fi
+
+          echo "Generated cluster config:"
+          cat "$output"
+
+          echo "Cluster config generated at $output"
+
+
       # Cria o cluster EKS usando a configuração em eks/cluster-config.yaml
       # Isso inclui: VPC, node groups, OIDC provider e configurações de rede
       # Tempo estimado: 15-20 minutos
@@ -50,11 +220,12 @@ jobs:
         run: |
           eksctl create cluster -f eks/cluster-config.yaml
           echo "Cluster created successfully"
-      
+
       - name: Update kubeconfig
         run: |
           aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
           kubectl get nodes
+
   
   setup-namespaces:
     name: Create Namespaces
@@ -73,6 +244,11 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve AWS account ID
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID" >> $GITHUB_ENV
       
       # Atualiza o kubeconfig local para apontar para o cluster EKS
       # Isso permite usar kubectl para interagir com o cluster
@@ -81,11 +257,11 @@ jobs:
           aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
       
       # Namespaces são isolamentos lógicos dentro do cluster Kubernetes
-      # agro-tech: namespace principal onde todas as APIs serão deployadas
+      # Namespace principal configuravel para apps
       # external-secrets: namespace para o operador de sincronização de secrets
       - name: Create Namespaces
         run: |
-          kubectl create namespace agro-tech --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create namespace ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
           kubectl create namespace external-secrets --dry-run=client -o yaml | kubectl apply -f -
           echo "Namespaces created"
   
@@ -105,13 +281,22 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve AWS account ID
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          if [ -z "$AWS_ACCOUNT_ID" ]; then
+            echo "Unable to resolve AWS account ID"
+            exit 1
+          fi
+          echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID" >> $GITHUB_ENV
       
       - name: Install eksctl
         run: |
           curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz"
           tar -xzf eksctl_Linux_amd64.tar.gz -C /tmp
           sudo mv /tmp/eksctl /usr/local/bin
-      
+
       # IAM Policy define as permissões necessárias para o ALB Controller
       # Permite criar/gerenciar Application Load Balancers, Target Groups, etc.
       - name: Create IAM Policy for ALB Controller (if not exists)
@@ -128,6 +313,13 @@ jobs:
       
       # IAM Policy para External Secrets ler secrets do AWS Secrets Manager
       # Permite GetSecretValue e DescribeSecret para secrets específicos
+      - name: Generate External Secrets policy
+        run: |
+          sed -e "s|{{AWS_REGION}}|${{ env.AWS_REGION }}|g" \
+              -e "s|{{AWS_ACCOUNT_ID}}|${{ env.AWS_ACCOUNT_ID }}|g" \
+              -e "s|{{SECRETS_PREFIX}}|${{ env.SECRETS_PREFIX }}|g" \
+              iam/external-secrets-policy.json > iam/external-secrets-policy.generated.json
+
       - name: Create IAM Policy for External Secrets (if not exists)
         run: |
           if aws iam get-policy --policy-arn arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:policy/AgroTechExternalSecretsPolicy 2>/dev/null; then
@@ -136,8 +328,12 @@ jobs:
             echo "Creating External Secrets IAM policy..."
             aws iam create-policy \
               --policy-name AgroTechExternalSecretsPolicy \
-              --policy-document file://iam/external-secrets-policy.json || true
+              --policy-document file://iam/external-secrets-policy.generated.json || true
           fi
+
+      - name: Cleanup generated policies
+        run: |
+          rm -f iam/external-secrets-policy.generated.json
       
       # IRSA (IAM Roles for Service Accounts) permite que pods do Kubernetes
       # assumam roles IAM sem precisar de credenciais hardcoded
@@ -173,12 +369,22 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve AWS account ID
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          if [ -z "$AWS_ACCOUNT_ID" ]; then
+            echo "Unable to resolve AWS account ID"
+            exit 1
+          fi
+          echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID" >> $GITHUB_ENV
       
       - name: Install eksctl
         run: |
           curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz"
           tar -xzf eksctl_Linux_amd64.tar.gz -C /tmp
           sudo mv /tmp/eksctl /usr/local/bin
+
       
       - name: Update kubeconfig
         run: |
@@ -192,6 +398,13 @@ jobs:
       
       # IAM Policy para CloudWatch Application Signals
       # Permite enviar logs, traces e métricas para CloudWatch e X-Ray
+      - name: Generate CloudWatch Application Signals policy
+        run: |
+          sed -e "s|{{AWS_REGION}}|${{ env.AWS_REGION }}|g" \
+              -e "s|{{AWS_ACCOUNT_ID}}|${{ env.AWS_ACCOUNT_ID }}|g" \
+              -e "s|{{CLUSTER_NAME}}|${{ env.CLUSTER_NAME }}|g" \
+              iam/cloudwatch-application-signals-policy.json > iam/cloudwatch-application-signals-policy.generated.json
+
       - name: Create IAM Policy for CloudWatch Application Signals (if not exists)
         run: |
           if aws iam get-policy --policy-arn arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:policy/CloudWatchApplicationSignalsPolicy 2>/dev/null; then
@@ -200,9 +413,13 @@ jobs:
             echo "Creating CloudWatch Application Signals IAM policy..."
             aws iam create-policy \
               --policy-name CloudWatchApplicationSignalsPolicy \
-              --policy-document file://iam/cloudwatch-application-signals-policy.json || true
+              --policy-document file://iam/cloudwatch-application-signals-policy.generated.json || true
           fi
-      
+
+      - name: Cleanup generated policies
+        run: |
+          rm -f iam/cloudwatch-application-signals-policy.generated.json
+
       # IRSA para CloudWatch Agent - permite enviar telemetria sem credenciais hardcoded
       - name: Create IRSA for CloudWatch Application Signals
         run: |
@@ -352,7 +569,7 @@ jobs:
           
           # Aplica retenção para log groups do Container Insights
           aws logs describe-log-groups \
-            --log-group-name-prefix /aws/containerinsights/agro-tech \
+            --log-group-name-prefix /aws/containerinsights/${{ env.CLUSTER_NAME }} \
             --region ${{ env.AWS_REGION }} \
             --query 'logGroups[].logGroupName' \
             --output text 2>/dev/null | tr '\t' '\n' | while read log_group; do

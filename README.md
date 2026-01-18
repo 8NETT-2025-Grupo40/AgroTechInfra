@@ -10,8 +10,8 @@ agro-tech-infra/
 │   ├── cluster-setup.yml      # Create/update EKS cluster
 │   └── cluster-destroy.yml    # Destroy EKS cluster
 ├── eks/
-│   ├── cluster-config.yaml    # eksctl cluster configuration
-│   └── README.md              # EKS documentation
+│   ├── cluster-config.template.yaml # Template eksctl cluster configuration
+│   └── README.md                    # EKS documentation
 ├── iam/
 │   ├── alb-controller-policy.json                  # IAM policy for ALB Controller
 │   ├── external-secrets-policy.json                # IAM policy for External Secrets
@@ -24,7 +24,7 @@ agro-tech-infra/
 Este repositório é responsável por:
 
 **Gerenciamento do Cluster EKS**
-- Criar/deletar o cluster `agro-tech` em `us-east-1`
+- Criar/deletar o cluster informado no input `CLUSTER_NAME`
 - Gerenciar node groups e políticas de scaling
 - Configurar OIDC provider para IRSA (IAM Roles for Service Accounts)
 
@@ -38,8 +38,9 @@ Este repositório é responsável por:
 - `AgroTechExternalSecretsPolicy`: Para leitura de secrets do Secrets Manager
 
 **Namespaces**
-- `agro-tech`: Namespace principal para todos os serviços de API
+- `K8S_NAMESPACE`: Namespace principal para todos os serviços de API
 - `external-secrets`: Para External Secrets Operator
+
 
 **NÃO é Responsável Por**
 - Código das aplicações (reside nos repositórios individuais de cada API)
@@ -51,9 +52,6 @@ Este repositório é responsável por:
 
 ### Pré-requisitos
 
-- AWS Account: `478511033947`
-- AWS Region: `us-east-1`
-- VPC Existente: `vpc-0e6d1df089da1ec39`
 - GitHub Secrets configurados:
   - `AWS_ACCESS_KEY_ID`
   - `AWS_SECRET_ACCESS_KEY`
@@ -64,40 +62,55 @@ Este repositório é responsável por:
 
 1. Acesse **Actions** → **Setup EKS Cluster & Add-ons**
 2. Clique em **Run workflow**
-3. Configure as opções:
+3. Preencha os inputs obrigatórios:
+   - `AWS_REGION`: ex. `us-east-1`
+   - `CLUSTER_NAME`: ex. `agro-tech`
+   - `VPC_ID`: ex. `vpc-0123456789abcdef0`
+   - `PUBLIC_SUBNET_IDS`: lista separada por vírgula
+   - `K8S_NAMESPACE`: ex. `agro-tech`
+   - `SECRETS_PREFIX`: ex. `agro-tech`
+   - `NODE_INSTANCE_TYPE`: ex. `t3a.medium`
+   - `NODE_MIN`: ex. `2`
+   - `NODE_DESIRED`: ex. `3`
+   - `NODE_MAX`: ex. `10`
+4. Configure as opções:
    - `skip_cluster`: Marque se o cluster já existe
    - `skip_addons`: Marque se os add-ons já estão instalados
-4. Clique em **Run workflow** e monitore o progresso (~15-20 minutos)
+5. Clique em **Run workflow** e monitore o progresso (~15-20 minutos)
 
 #### Destruir Cluster
 
 1. Acesse **Actions** → **Destroy EKS Cluster**
 2. Clique em **Run workflow**
-3. Digite **`DESTROY`** no campo de confirmação
-4. Clique em **Run workflow** e monitore o progresso (~10-15 minutos)
+3. Preencha `AWS_REGION` e `CLUSTER_NAME`
+4. Digite **`DESTROY`** no campo de confirmação
+5. Clique em **Run workflow** e monitore o progresso (~10-15 minutos)
 
 **AVISO**: Isso deleta o cluster inteiro e todos os deployments!
+
 
 
 ## Configuração do Cluster
 
 ### Detalhes do Cluster
 
-- **Nome**: `agro-tech`
-- **Região**: `us-east-1`
+- **Nome**: input `CLUSTER_NAME`
+- **Região**: input `AWS_REGION`
 - **Versão Kubernetes**: `1.34`
-- **Account ID**: `478511033947`
-- **VPC**: `vpc-0e6d1df089da1ec39`
+- **Account ID**: derivado via STS no workflow
+- **VPC**: input `VPC_ID`
 - **Modo de Autenticação**: `API_AND_CONFIG_MAP`
+
 
 ### Node Group
 
 - **Nome**: `low-cost`
-- **Tipo de Instância**: `t3a.small`
-- **Capacidade Desejada**: 2 nodes
-- **Tamanho Mínimo**: 2 nodes
-- **Tamanho Máximo**: 3 nodes
-- **Zonas de Disponibilidade**: `us-east-1a`, `us-east-1b`
+- **Tipo de Instância**: input `NODE_INSTANCE_TYPE`
+- **Capacidade Desejada**: input `NODE_DESIRED`
+- **Tamanho Mínimo**: input `NODE_MIN`
+- **Tamanho Máximo**: input `NODE_MAX`
+- **Subnets**: input `PUBLIC_SUBNET_IDS`
+
 
 ### Add-ons Instalados
 
@@ -137,201 +150,20 @@ O cluster possui observabilidade automática via CloudWatch Application Signals,
 ```bash
 # Status do add-on
 aws eks describe-addon \
-  --cluster-name agro-tech \
+  --cluster-name <CLUSTER_NAME> \
   --addon-name amazon-cloudwatch-observability \
-  --region us-east-1
+  --region <AWS_REGION>
 
 # Pods do CloudWatch
 kubectl get pods -n amazon-cloudwatch
 kubectl get daemonsets -n amazon-cloudwatch
 
-# Verificar uso de memória (importante para t3a.small)
+# Verificar uso de memória (importante para t3a.medium)
 kubectl top nodes
-```
+kubectl top pods -n <K8S_NAMESPACE>
 
-### Configurar Retenção de Logs (Novos Log Groups)
+# Nota: o namespace principal depende do input K8S_NAMESPACE
 
-Quando você instrumenta novas aplicações, novos log groups podem ser criados. 
-
-**Dica:** Re-execute o workflow `Setup EKS Cluster & Add-ons` com `skip_cluster=true` para aplicar retenção automaticamente.
-
-## Integração com Serviços de API
-
-### O Que Cada Repositório de API Deve Fazer
-
-Cada serviço de API (ex: `AgroTechUserApi`, `AgroTechPaymentApi`) é responsável por:
-
-1. **Build e Push da Imagem Docker para ECR**
-   ```bash
-   docker build -t <account>.dkr.ecr.us-east-1.amazonaws.com/<api-name>:latest .
-   docker push <account>.dkr.ecr.us-east-1.amazonaws.com/<api-name>:latest
-   ```
-
-2. **Criar IRSA (IAM Role for Service Account)**
-   ```bash
-   eksctl create iamserviceaccount \
-     --cluster=agro-tech \
-     --namespace=agro-tech \
-     --name=<api-name>-sa \
-     --attach-policy-arn=arn:aws:iam::478511033947:policy/AgroTechExternalSecretsPolicy \
-     --approve \
-     --override-existing-serviceaccounts \
-     --region=us-east-1
-   ```
-
-3. **Deploy via Helm no namespace `agro-tech`**
-   ```bash
-   helm upgrade --install <api-name> ./k8s \
-     --namespace agro-tech \
-     --set image.tag=<version> \
-     --wait
-   ```
-
-4. **Configurar Ingress com ALB Compartilhado**
-   ```yaml
-   annotations:
-     alb.ingress.kubernetes.io/group.name: agro-tech  # Compartilha ALB com outras APIs
-     alb.ingress.kubernetes.io/target-type: ip
-   ```
-
-### Pré-requisitos para Deploy de API
-
-Antes de fazer deploy de qualquer API, certifique-se:
-
-- Cluster EKS `agro-tech` existe e está rodando
-- Namespace `agro-tech` existe
-- AWS Load Balancer Controller está instalado
-- External Secrets Operator está instalado
-- Repositório ECR para a API existe
-- Secrets do AWS Secrets Manager estão criados (ex: `agro-tech-api-<name>-connection-string`)
-
-### Exemplo: Deploy da User API
-
-Veja o [repositório AgroTechUserApi](https://github.com/8NETT-2025-Grupo40/AgroTechUserApi) para um exemplo completo de:
-- Estrutura do Helm chart (diretório `k8s/`)
-- Workflow GitHub Actions para deployment no EKS
-- Configuração IRSA para External Secrets
-
-## Políticas IAM
-
-### AWSLoadBalancerControllerIAMPolicy
-
-**ARN**: `AWSLoadBalancerControllerIAMPolicy`
-
-**Propósito**: Permitir que o ALB Controller gerencie Application Load Balancers
-
-**Vinculado a**: ServiceAccount `aws-load-balancer-controller` no `kube-system`
-
-### AgroTechExternalSecretsPolicy
-
-**ARN**: `AgroTechExternalSecretsPolicy`
-
-**Propósito**: Permitir leitura de secrets do AWS Secrets Manager
-
-**Permissões**:
-- `secretsmanager:GetSecretValue`
-- `secretsmanager:DescribeSecret`
-
-**Recursos**:
-- `agro-tech-api-user-connection-string*`
-- `agro-tech-jwt-config*`
-- (Adicionar mais conforme necessário para outras APIs)
-
-**Vinculado a**: ServiceAccount de cada API (criado durante o deployment da API)
-
-### CloudWatchApplicationSignalsPolicy
-
-**ARN**: `CloudWatchApplicationSignalsPolicy`
-
-**Propósito**: Permitir envio de telemetria para CloudWatch e X-Ray
-
-**Permissões**:
-- `logs:PutLogEvents`, `logs:CreateLogGroup`, `logs:PutRetentionPolicy`
-- `xray:PutTraceSegments`, `xray:PutTelemetryRecords`
-- `cloudwatch:PutMetricData`
-- `ec2:Describe*` (para metadata)
-- `eks:DescribeCluster`
-
-**Vinculado a**: ServiceAccount `cloudwatch-agent` no `amazon-cloudwatch`
-
-## Troubleshooting
-
-### Cluster Não Está Criando
-
-```bash
-# Verificar versão do eksctl
-eksctl version
-
-# Validar configuração do cluster
-eksctl create cluster -f eks/cluster-config.yaml --dry-run
-
-# Verificar credenciais AWS
-aws sts get-caller-identity
-```
-
-### ALB Não Está Provisionando
-
-```bash
-# Verificar logs do ALB Controller
-kubectl logs -n kube-system deployment/aws-load-balancer-controller
-
-# Verificar status do Ingress
-kubectl describe ingress -n agro-tech <ingress-name>
-
-# Verificar annotation IRSA do ServiceAccount
-kubectl get sa -n kube-system aws-load-balancer-controller -o yaml
-```
-
-### External Secrets Não Está Sincronizando
-
-```bash
-# Verificar logs do External Secrets Operator
-kubectl logs -n external-secrets deployment/external-secrets
-
-# Verificar status do SecretStore
-kubectl get secretstore -n agro-tech
-kubectl describe secretstore -n agro-tech <secretstore-name>
-
-# Verificar status do ExternalSecret
-kubectl get externalsecret -n agro-tech
-kubectl describe externalsecret -n agro-tech <externalsecret-name>
-```
-
-### Nodes Não Estão Ready
-
-```bash
-# Verificar status dos nodes
-kubectl get nodes
-
-# Descrever node
-kubectl describe node <node-name>
-
-# Verificar node group no eksctl
-eksctl get nodegroup --cluster=agro-tech --region=us-east-1
-```
-
-## Monitoramento e Manutenção
-
-### Verificar Saúde do Cluster
-
-```bash
-# Obter informações do cluster
-aws eks describe-cluster --name agro-tech --region us-east-1
-
-# Verificar nodes
-kubectl get nodes
-
-# Verificar pods do sistema
-kubectl get pods -n kube-system
-kubectl get pods -n external-secrets
-kubectl get pods -n amazon-cloudwatch
-
-# Verificar todos os deployments no namespace agro-tech
-kubectl get deployments -n agro-tech
-
-# Verificar uso de recursos (importante para t3a.small)
-kubectl top nodes
-kubectl top pods -n agro-tech
 ```
 
 ### Atualizar Add-ons

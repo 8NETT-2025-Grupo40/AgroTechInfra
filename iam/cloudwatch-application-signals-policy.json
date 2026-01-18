@@ -13,8 +13,8 @@
         "logs:PutRetentionPolicy"
       ],
       "Resource": [
-        "arn:aws:logs:us-east-1:478511033947:log-group:/aws/application-signals/*",
-        "arn:aws:logs:us-east-1:478511033947:log-group:/aws/containerinsights/agro-tech/*"
+        "arn:aws:logs:{{AWS_REGION}}:{{AWS_ACCOUNT_ID}}:log-group:/aws/application-signals/*",
+        "arn:aws:logs:{{AWS_REGION}}:{{AWS_ACCOUNT_ID}}:log-group:/aws/containerinsights/{{CLUSTER_NAME}}/*"
       ]
     },
     {
@@ -62,7 +62,7 @@
       "Action": [
         "eks:DescribeCluster"
       ],
-      "Resource": "arn:aws:eks:us-east-1:478511033947:cluster/agro-tech"
+      "Resource": "arn:aws:eks:{{AWS_REGION}}:{{AWS_ACCOUNT_ID}}:cluster/{{CLUSTER_NAME}}"
     }
   ]
 }
