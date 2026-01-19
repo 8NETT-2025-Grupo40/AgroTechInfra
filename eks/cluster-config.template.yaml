@@ -1,0 +1,39 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: "{{CLUSTER_NAME}}"
+  region: "{{AWS_REGION}}"
+  version: "1.34"
+
+# OIDC Provider automatico
+iam:
+  withOIDC: true
+
+# Usar VPC existente
+vpc:
+  id: "{{VPC_ID}}"
+  subnets:
+    public:
+      __PUBLIC_SUBNETS__
+# Access Control (EKS 1.34+)
+accessConfig:
+  authenticationMode: API_AND_CONFIG_MAP
+
+# Node Group
+managedNodeGroups:
+  - name: low-cost
+    instanceType: "{{NODE_INSTANCE_TYPE}}"
+    desiredCapacity: {{NODE_DESIRED}}
+    minSize: {{NODE_MIN}}
+    maxSize: {{NODE_MAX}}
+    # Usar subnets informadas
+    subnets:
+      __NODEGROUP_SUBNETS__
+    labels:
+      role: worker
+      environment: production
+    tags:
+      Name: '{{CLUSTER_NAME}}-low-cost-node'
+      Environment: production
+      Project: '{{CLUSTER_NAME}}'
