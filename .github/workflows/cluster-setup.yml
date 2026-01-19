@@ -163,7 +163,7 @@ jobs:
             exit 1
           fi
 
-          while read -r subnet az vpc; do
+          while read -r az subnet vpc; do
             if [ -z "$subnet" ] || [ -z "$az" ]; then
               continue
             fi
