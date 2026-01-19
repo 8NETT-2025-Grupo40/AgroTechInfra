@@ -202,7 +202,7 @@ jobs:
               -e "s|{{NODE_MAX}}|$NODE_MAX|g" \
               "$template" > "$output"
 
-          perl -0pi -e "s|^\s*__PUBLIC_SUBNETS__|$ENV{PUBLIC_SUBNETS_YAML}|gm; s|^\s*__NODEGROUP_SUBNETS__|$ENV{NODEGROUP_SUBNETS_YAML}|gm" "$output"
+          perl -0pi -e 's|^\s*__PUBLIC_SUBNETS__|$ENV{PUBLIC_SUBNETS_YAML}|gm; s|^\s*__NODEGROUP_SUBNETS__|$ENV{NODEGROUP_SUBNETS_YAML}|gm' "$output"
 
           if grep -q "__PUBLIC_SUBNETS__" "$output" || grep -q "__NODEGROUP_SUBNETS__" "$output"; then
             echo "Failed to render subnet placeholders"
