@@ -19,13 +19,15 @@ on:
         type: string
 
 env:
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID_TEMP }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY_TEMP }}
+  # Centraliza credenciais e inputs para o workflow
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   AWS_REGION: ${{ inputs.AWS_REGION }}
   CLUSTER_NAME: ${{ inputs.CLUSTER_NAME }}
 
 
 jobs:
+  # Job 1: valida confirmacao e inputs obrigatorios
   validate-input:
     name: Validate Destruction Confirmation
     runs-on: ubuntu-latest
@@ -55,6 +57,7 @@ jobs:
             exit 1
           fi
   
+  # Job 2: remove releases, add-ons e o cluster EKS
   destroy-cluster:
     name: Delete EKS Cluster and Resources
     runs-on: ubuntu-latest
@@ -80,10 +83,12 @@ jobs:
       
       - name: Install Helm
         run: |
+          # Helm e usado para remover releases antes do delete do cluster
           curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
       - name: Update kubeconfig
         run: |
+          # Necessario para helm/kubectl apontarem para o cluster certo
           aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
 
       
@@ -152,6 +157,7 @@ jobs:
       # --wait garante que o comando só retorna após a deleção completa
       - name: Delete EKS Cluster
         run: |
+          # Remove control plane, node groups e OIDC provider
           echo "Deleting EKS cluster..."
           eksctl delete cluster --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }} --wait
           echo "Cluster deleted"
