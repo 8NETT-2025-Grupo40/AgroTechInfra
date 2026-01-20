@@ -1,0 +1,193 @@
+name: Create VPC (Public)
+
+on:
+  workflow_dispatch:
+    inputs:
+      AWS_REGION:
+        description: 'AWS region (ex: us-east-1)'
+        type: string
+        required: true
+        default: 'us-east-1'
+      VPC_NAME:
+        description: 'VPC name tag'
+        type: string
+        required: true
+        default: 'agro-tech-vpc'
+      CLUSTER_NAME:
+        description: 'Cluster name for subnet tags'
+        type: string
+        required: true
+        default: 'agro-tech'
+      VPC_CIDR:
+        description: 'VPC CIDR block'
+        type: string
+        required: true
+        default: '10.0.0.0/16'
+      PUBLIC_SUBNET_CIDRS:
+        description: 'Public subnet CIDRs (comma-separated)'
+        type: string
+        required: true
+        default: '10.0.0.0/20,10.0.16.0/20'
+      PUBLIC_SUBNET_AZS:
+        description: 'Public subnet AZs (comma-separated)'
+        type: string
+        required: true
+        default: 'us-east-1a,us-east-1b'
+      confirm_create:
+        description: 'Type "CREATE" to confirm VPC creation'
+        type: string
+        required: true
+
+env:
+  # Centraliza credenciais e inputs para todos os steps
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_REGION: ${{ inputs.AWS_REGION }}
+  VPC_NAME: ${{ inputs.VPC_NAME }}
+  CLUSTER_NAME: ${{ inputs.CLUSTER_NAME }}
+  VPC_CIDR: ${{ inputs.VPC_CIDR }}
+  PUBLIC_SUBNET_CIDRS: ${{ inputs.PUBLIC_SUBNET_CIDRS }}
+  PUBLIC_SUBNET_AZS: ${{ inputs.PUBLIC_SUBNET_AZS }}
+
+jobs:
+  # Job unico: cria VPC publica com subnets e rota para IGW
+  create-vpc:
+    name: Create VPC and Public Subnets
+    runs-on: ubuntu-latest
+
+    steps:
+      # Usa as credenciais centralizadas para todas as chamadas AWS
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate inputs
+        run: |
+          # Confirmação explicita para evitar criação acidental
+          if [ "${{ inputs.confirm_create }}" != "CREATE" ]; then
+            echo "Confirmation failed. Type CREATE to proceed."
+            exit 1
+          fi
+
+          IFS=',' read -ra CIDRS <<< "$PUBLIC_SUBNET_CIDRS"
+          IFS=',' read -ra AZS <<< "$PUBLIC_SUBNET_AZS"
+
+          CLEAN_CIDRS=()
+          CLEAN_AZS=()
+
+          for cidr in "${CIDRS[@]}"; do
+            trimmed=$(echo "$cidr" | xargs)
+            if [ -n "$trimmed" ]; then
+              CLEAN_CIDRS+=("$trimmed")
+            fi
+          done
+
+          for az in "${AZS[@]}"; do
+            trimmed=$(echo "$az" | xargs)
+            if [ -n "$trimmed" ]; then
+              CLEAN_AZS+=("$trimmed")
+            fi
+          done
+
+          if [ ${#CLEAN_CIDRS[@]} -lt 2 ]; then
+            echo "PUBLIC_SUBNET_CIDRS must include at least 2 CIDRs"
+            exit 1
+          fi
+
+          if [ ${#CLEAN_CIDRS[@]} -ne ${#CLEAN_AZS[@]} ]; then
+            echo "PUBLIC_SUBNET_CIDRS and PUBLIC_SUBNET_AZS counts must match"
+            exit 1
+          fi
+
+          for az in "${CLEAN_AZS[@]}"; do
+            if [[ "$az" != "$AWS_REGION"* ]]; then
+              echo "AZ $az does not match region $AWS_REGION"
+              exit 1
+            fi
+          done
+
+      - name: Create VPC and networking
+        run: |
+          # Cria VPC, IGW, route table e subnets publicas com tags para EKS
+          set -euo pipefail
+
+          VPC_ID=$(aws ec2 create-vpc \
+            --cidr-block "$VPC_CIDR" \
+            --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=$VPC_NAME}]" \
+            --query 'Vpc.VpcId' --output text)
+
+          aws ec2 modify-vpc-attribute --vpc-id "$VPC_ID" --enable-dns-support '{"Value":true}'
+          aws ec2 modify-vpc-attribute --vpc-id "$VPC_ID" --enable-dns-hostnames '{"Value":true}'
+
+          IGW_ID=$(aws ec2 create-internet-gateway \
+            --tag-specifications "ResourceType=internet-gateway,Tags=[{Key=Name,Value=$VPC_NAME-igw}]" \
+            --query 'InternetGateway.InternetGatewayId' --output text)
+          aws ec2 attach-internet-gateway --vpc-id "$VPC_ID" --internet-gateway-id "$IGW_ID"
+
+          RT_ID=$(aws ec2 create-route-table \
+            --vpc-id "$VPC_ID" \
+            --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value=$VPC_NAME-public-rt}]" \
+            --query 'RouteTable.RouteTableId' --output text)
+
+          aws ec2 create-route --route-table-id "$RT_ID" --destination-cidr-block 0.0.0.0/0 --gateway-id "$IGW_ID"
+
+          IFS=',' read -ra CIDRS <<< "$PUBLIC_SUBNET_CIDRS"
+          IFS=',' read -ra AZS <<< "$PUBLIC_SUBNET_AZS"
+          SUBNET_IDS=()
+          CLEAN_CIDRS=()
+          CLEAN_AZS=()
+
+          for cidr in "${CIDRS[@]}"; do
+            trimmed=$(echo "$cidr" | xargs)
+            if [ -n "$trimmed" ]; then
+              CLEAN_CIDRS+=("$trimmed")
+            fi
+          done
+
+          for az in "${AZS[@]}"; do
+            trimmed=$(echo "$az" | xargs)
+            if [ -n "$trimmed" ]; then
+              CLEAN_AZS+=("$trimmed")
+            fi
+          done
+
+          if [ ${#CLEAN_CIDRS[@]} -ne ${#CLEAN_AZS[@]} ]; then
+            echo "PUBLIC_SUBNET_CIDRS and PUBLIC_SUBNET_AZS counts must match"
+            exit 1
+          fi
+
+          for i in "${!CLEAN_CIDRS[@]}"; do
+            cidr="${CLEAN_CIDRS[$i]}"
+            az="${CLEAN_AZS[$i]}"
+            subnet_name="${VPC_NAME}-public-${az}"
+
+            # Tags do EKS e role/elb sao necessarias para o ALB Controller
+            subnet_id=$(aws ec2 create-subnet \
+              --vpc-id "$VPC_ID" \
+              --cidr-block "$cidr" \
+              --availability-zone "$az" \
+              --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=$subnet_name},{Key=kubernetes.io/role/elb,Value=1},{Key=kubernetes.io/cluster/$CLUSTER_NAME,Value=shared}]" \
+              --query 'Subnet.SubnetId' --output text)
+
+            aws ec2 modify-subnet-attribute --subnet-id "$subnet_id" --map-public-ip-on-launch
+            # Route table publica garante acesso via IGW
+            aws ec2 associate-route-table --route-table-id "$RT_ID" --subnet-id "$subnet_id"
+            SUBNET_IDS+=("$subnet_id")
+          done
+
+          SUBNET_IDS_CSV=$(IFS=,; echo "${SUBNET_IDS[*]}")
+
+          echo "VPC_ID=$VPC_ID" >> $GITHUB_ENV
+          echo "IGW_ID=$IGW_ID" >> $GITHUB_ENV
+          echo "ROUTE_TABLE_ID=$RT_ID" >> $GITHUB_ENV
+          echo "PUBLIC_SUBNET_IDS=$SUBNET_IDS_CSV" >> $GITHUB_ENV
+
+          # Resumo final para copiar IDs no setup do cluster
+          echo "## VPC Created" >> $GITHUB_STEP_SUMMARY
+          echo "- VPC_ID: $VPC_ID" >> $GITHUB_STEP_SUMMARY
+          echo "- IGW_ID: $IGW_ID" >> $GITHUB_STEP_SUMMARY
+          echo "- ROUTE_TABLE_ID: $RT_ID" >> $GITHUB_STEP_SUMMARY
+          echo "- PUBLIC_SUBNET_IDS: $SUBNET_IDS_CSV" >> $GITHUB_STEP_SUMMARY

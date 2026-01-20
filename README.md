@@ -8,7 +8,8 @@ Este repositório gerencia a **infraestrutura compartilhada** para a plataforma 
 agro-tech-infra/
 ├── .github/workflows/
 │   ├── cluster-setup.yml      # Create/update EKS cluster
-│   └── cluster-destroy.yml    # Destroy EKS cluster
+│   ├── cluster-destroy.yml    # Destroy EKS cluster
+│   └── vpc-setup.yml          # Create VPC and public subnets
 ├── eks/
 │   ├── cluster-config.template.yaml # Template eksctl cluster configuration
 │   └── README.md                    # EKS documentation
@@ -57,6 +58,20 @@ Este repositório é responsável por:
   - `AWS_SECRET_ACCESS_KEY`
 
 ### GitHub Actions (Recomendado)
+
+#### Criar VPC Pública
+
+1. Acesse **Actions** → **Create VPC (Public)**
+2. Clique em **Run workflow**
+3. Preencha os inputs obrigatórios:
+   - `AWS_REGION`: ex. `us-east-1`
+   - `VPC_NAME`: ex. `agro-tech-vpc`
+   - `CLUSTER_NAME`: ex. `agro-tech`
+   - `VPC_CIDR`: ex. `10.0.0.0/16`
+   - `PUBLIC_SUBNET_CIDRS`: lista separada por vírgula
+   - `PUBLIC_SUBNET_AZS`: lista separada por vírgula
+4. Digite **`CREATE`** no campo de confirmação
+5. Copie o `VPC_ID` e `PUBLIC_SUBNET_IDS` do resumo do workflow
 
 #### Criar/Atualizar Cluster
 

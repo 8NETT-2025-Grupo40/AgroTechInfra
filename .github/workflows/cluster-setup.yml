@@ -63,6 +63,9 @@ on:
         default: false
 
 env:
+  # Centraliza credenciais e inputs para todos os jobs
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   AWS_REGION: ${{ inputs.AWS_REGION }}
   CLUSTER_NAME: ${{ inputs.CLUSTER_NAME }}
   VPC_ID: ${{ inputs.VPC_ID }}
@@ -76,6 +79,7 @@ env:
 
 
 jobs:
+  # Job 1: cria o cluster EKS e o nodegroup base
   setup-cluster:
     name: Create EKS Cluster
     runs-on: ubuntu-latest
@@ -89,8 +93,8 @@ jobs:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
       
       # eksctl é a ferramenta CLI oficial para criar e gerenciar clusters EKS
@@ -103,6 +107,7 @@ jobs:
 
       - name: Validate inputs
         run: |
+          # Garante inputs obrigatorios e sizing consistente
           missing=false
           for var in AWS_REGION CLUSTER_NAME VPC_ID PUBLIC_SUBNET_IDS K8S_NAMESPACE SECRETS_PREFIX NODE_INSTANCE_TYPE NODE_MIN NODE_DESIRED NODE_MAX; do
             value=$(printenv "$var")
@@ -127,11 +132,13 @@ jobs:
 
       - name: Resolve AWS account ID
         run: |
+          # Necessario para montar ARNs de policies e IRSA
           AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID" >> $GITHUB_ENV
 
       - name: Generate cluster config
         run: |
+          # Monta YAML de subnets e nodegroup a partir dos inputs
           IFS=',' read -ra SUBNETS <<< "$PUBLIC_SUBNET_IDS"
           CLEAN_SUBNETS=()
           for subnet in "${SUBNETS[@]}"; do
@@ -161,7 +168,7 @@ jobs:
             exit 1
           fi
 
-          while read -r subnet az vpc; do
+          while read -r az subnet vpc; do
             if [ -z "$subnet" ] || [ -z "$az" ]; then
               continue
             fi
@@ -174,8 +181,8 @@ jobs:
               exit 1
             fi
             AZ_MAP[$az]=1
-            PUBLIC_SUBNETS_YAML+=$(printf "      %s:\n        id: %s\n" "$az" "$subnet")
-            NODEGROUP_SUBNETS_YAML+=$(printf "      - %s\n" "$subnet")
+            printf -v PUBLIC_SUBNETS_YAML '%s      %s:\n        id: %s\n' "$PUBLIC_SUBNETS_YAML" "$az" "$subnet"
+            printf -v NODEGROUP_SUBNETS_YAML '%s      - %s\n' "$NODEGROUP_SUBNETS_YAML" "$subnet"
           done <<< "$SUBNET_INFO"
 
           if [ ${#AZ_MAP[@]} -lt 2 ]; then
@@ -200,7 +207,7 @@ jobs:
               -e "s|{{NODE_MAX}}|$NODE_MAX|g" \
               "$template" > "$output"
 
-          perl -0pi -e "s|^\s*__PUBLIC_SUBNETS__|$ENV{PUBLIC_SUBNETS_YAML}|gm; s|^\s*__NODEGROUP_SUBNETS__|$ENV{NODEGROUP_SUBNETS_YAML}|gm" "$output"
+          perl -0pi -e 's|^\s*__PUBLIC_SUBNETS__|$ENV{PUBLIC_SUBNETS_YAML}|gm; s|^\s*__NODEGROUP_SUBNETS__|$ENV{NODEGROUP_SUBNETS_YAML}|gm' "$output"
 
           if grep -q "__PUBLIC_SUBNETS__" "$output" || grep -q "__NODEGROUP_SUBNETS__" "$output"; then
             echo "Failed to render subnet placeholders"
@@ -213,8 +220,8 @@ jobs:
           echo "Cluster config generated at $output"
 
 
-      # Cria o cluster EKS usando a configuração em eks/cluster-config.yaml
-      # Isso inclui: VPC, node groups, OIDC provider e configurações de rede
+      # Cria o cluster EKS usando a configuracao gerada
+      # Inclui: VPC existente, nodegroup, OIDC provider e networking
       # Tempo estimado: 15-20 minutos
       - name: Create EKS Cluster
         run: |
@@ -223,10 +230,12 @@ jobs:
 
       - name: Update kubeconfig
         run: |
+          # Helm precisa de contexto valido para o cluster
           aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
           kubectl get nodes
 
   
+  # Job 2: cria namespaces usados pelos add-ons e apps
   setup-namespaces:
     name: Create Namespaces
     runs-on: ubuntu-latest
@@ -241,12 +250,13 @@ jobs:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Resolve AWS account ID
         run: |
+          # Cada job precisa resolver o account ID separadamente
           AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID" >> $GITHUB_ENV
       
@@ -256,15 +266,16 @@ jobs:
         run: |
           aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
       
-      # Namespaces são isolamentos lógicos dentro do cluster Kubernetes
+      # Namespaces sao isolamentos logicos dentro do cluster Kubernetes
       # Namespace principal configuravel para apps
-      # external-secrets: namespace para o operador de sincronização de secrets
+      # external-secrets: namespace para o operador de sincronizacao de secrets
       - name: Create Namespaces
         run: |
           kubectl create namespace ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
           kubectl create namespace external-secrets --dry-run=client -o yaml | kubectl apply -f -
           echo "Namespaces created"
   
+  # Job 3: configura IRSA e policies para o ALB Controller e External Secrets
   setup-irsa-alb:
     name: Setup IRSA for AWS Load Balancer Controller
     runs-on: ubuntu-latest
@@ -278,12 +289,13 @@ jobs:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Resolve AWS account ID
         run: |
+          # Cada job precisa resolver o account ID separadamente
           AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           if [ -z "$AWS_ACCOUNT_ID" ]; then
             echo "Unable to resolve AWS account ID"
@@ -315,6 +327,8 @@ jobs:
       # Permite GetSecretValue e DescribeSecret para secrets específicos
       - name: Generate External Secrets policy
         run: |
+          # Renderiza policy com region/account/prefix atuais
+          # O arquivo gerado e temporario e nao deve ser versionado
           sed -e "s|{{AWS_REGION}}|${{ env.AWS_REGION }}|g" \
               -e "s|{{AWS_ACCOUNT_ID}}|${{ env.AWS_ACCOUNT_ID }}|g" \
               -e "s|{{SECRETS_PREFIX}}|${{ env.SECRETS_PREFIX }}|g" \
@@ -333,6 +347,7 @@ jobs:
 
       - name: Cleanup generated policies
         run: |
+          # Remove o arquivo temporario usado para criar a policy
           rm -f iam/external-secrets-policy.generated.json
       
       # IRSA (IAM Roles for Service Accounts) permite que pods do Kubernetes
@@ -340,6 +355,7 @@ jobs:
       # Cria um ServiceAccount no Kubernetes vinculado a uma IAM Role
       - name: Create IRSA for ALB Controller
         run: |
+          # Vincula o service account do controller a IAM Role com policy de ALB
           eksctl create iamserviceaccount \
             --cluster=${{ env.CLUSTER_NAME }} \
             --namespace=kube-system \
@@ -353,6 +369,7 @@ jobs:
   # ============================================
   # CLOUDWATCH APPLICATION SIGNALS IRSA
   # ============================================
+  # Job 4: configura IRSA e policy para CloudWatch Application Signals
   setup-irsa-cloudwatch:
     name: Setup IRSA for CloudWatch Application Signals
     runs-on: ubuntu-latest
@@ -366,8 +383,8 @@ jobs:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Resolve AWS account ID
@@ -388,6 +405,7 @@ jobs:
       
       - name: Update kubeconfig
         run: |
+          # Necessario para kubectl criar namespace do CloudWatch
           aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
       
       # Namespace para o CloudWatch Agent e ADOT Collector
@@ -400,6 +418,8 @@ jobs:
       # Permite enviar logs, traces e métricas para CloudWatch e X-Ray
       - name: Generate CloudWatch Application Signals policy
         run: |
+          # Renderiza policy com region/account/cluster atuais
+          # O arquivo gerado e temporario e nao deve ser versionado
           sed -e "s|{{AWS_REGION}}|${{ env.AWS_REGION }}|g" \
               -e "s|{{AWS_ACCOUNT_ID}}|${{ env.AWS_ACCOUNT_ID }}|g" \
               -e "s|{{CLUSTER_NAME}}|${{ env.CLUSTER_NAME }}|g" \
@@ -407,6 +427,7 @@ jobs:
 
       - name: Create IAM Policy for CloudWatch Application Signals (if not exists)
         run: |
+          # Cria policy apenas se ainda nao existir
           if aws iam get-policy --policy-arn arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:policy/CloudWatchApplicationSignalsPolicy 2>/dev/null; then
             echo "Policy already exists"
           else
@@ -418,11 +439,13 @@ jobs:
 
       - name: Cleanup generated policies
         run: |
+          # Remove o arquivo temporario usado para criar a policy
           rm -f iam/cloudwatch-application-signals-policy.generated.json
 
       # IRSA para CloudWatch Agent - permite enviar telemetria sem credenciais hardcoded
       - name: Create IRSA for CloudWatch Application Signals
         run: |
+          # Vincula o service account do CloudWatch a IAM Role com policy de observabilidade
           eksctl create iamserviceaccount \
             --cluster=${{ env.CLUSTER_NAME }} \
             --namespace=amazon-cloudwatch \
@@ -433,6 +456,7 @@ jobs:
             --region=${{ env.AWS_REGION }} || true
           echo "IRSA created for CloudWatch Application Signals"
   
+  # Job 5: instala add-ons (ALB, External Secrets, CloudWatch)
   install-addons:
     name: Install Cluster Add-ons
     runs-on: ubuntu-latest
@@ -446,16 +470,16 @@ jobs:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
-      
+
       - name: Update kubeconfig
         run: |
+          # Necessario para kubectl criar namespaces
           aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
-      
-      # Helm é o gerenciador de pacotes do Kubernetes
-      # Facilita a instalação e gerenciamento de aplicações complexas
+          kubectl get nodes
+
       - name: Install Helm
         run: |
           curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
