@@ -176,8 +176,8 @@ jobs:
               exit 1
             fi
             AZ_MAP[$az]=1
-            PUBLIC_SUBNETS_YAML+=$(printf "      %s:\n        id: %s\n" "$az" "$subnet")
-            NODEGROUP_SUBNETS_YAML+=$(printf "      - %s\n" "$subnet")
+            printf -v PUBLIC_SUBNETS_YAML '%s      %s:\n        id: %s\n' "$PUBLIC_SUBNETS_YAML" "$az" "$subnet"
+            printf -v NODEGROUP_SUBNETS_YAML '%s      - %s\n' "$NODEGROUP_SUBNETS_YAML" "$subnet"
           done <<< "$SUBNET_INFO"
 
           if [ ${#AZ_MAP[@]} -lt 2 ]; then
