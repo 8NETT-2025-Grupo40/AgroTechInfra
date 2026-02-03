@@ -17,12 +17,12 @@ on:
         description: 'Existing VPC ID'
         type: string
         required: true
-        default: 'vpc-0123456789abcdef0'
+        default: 'vpc-0074f3d59fe45740d'
       PUBLIC_SUBNET_IDS:
         description: 'Public subnet IDs (comma-separated)'
         type: string
         required: true
-        default: 'subnet-0abc123456789def0,subnet-0def123456789abc0'
+        default: 'subnet-09ab9e52f2011feed,subnet-00b5f5e200d06c4e1'
       K8S_NAMESPACE:
         description: 'Namespace principal para apps'
         type: string
