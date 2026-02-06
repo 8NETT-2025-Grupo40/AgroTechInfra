@@ -151,7 +151,28 @@ jobs:
           done
           echo "Target groups cleaned up"
         continue-on-error: true
-      
+
+      - name: Delete EKS Nodegroups
+        run: |
+          echo "Checking if cluster exists..."
+          if eksctl get cluster --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }} &>/dev/null; then
+            echo "Cluster exists. Listing nodegroups..."
+            
+            NODEGROUPS=$(eksctl get nodegroup --cluster ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }} -o json | jq -r '.[].Name')
+            
+            if [ -z "$NODEGROUPS" ]; then
+              echo "No nodegroups found for cluster ${{ env.CLUSTER_NAME }}."
+            else
+              for NG in $NODEGROUPS; do
+                echo "Deleting nodegroup: $NG"
+                eksctl delete nodegroup --cluster ${{ env.CLUSTER_NAME }} --name "$NG" --region ${{ env.AWS_REGION }} --wait
+              done
+              echo "All nodegroups deleted successfully."
+            fi
+          else
+            echo "Cluster $EKS_CLUSTER does not exist. Nothing to delete."
+          fi        
+
       # Deleta o cluster EKS completamente
       # Isso inclui: control plane, node groups, OIDC provider e IRSA roles
       # --wait garante que o comando só retorna após a deleção completa
