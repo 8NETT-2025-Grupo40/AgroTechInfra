@@ -94,14 +94,26 @@ jobs:
       
       # Remove todas as aplicações instaladas via Helm antes de deletar o cluster
       # Isso permite que recursos da AWS (ALBs, etc) sejam limpos adequadamente
-      - name: Remove Helm Releases
+      - name: Remove Helm Releases (apps first)
         run: |
-          echo "Removing Helm releases..."
-          helm list -A -o json | jq -r '.[] | "\(.name) -n \(.namespace)"' | while read release; do
-            echo "Deleting: $release"
-            helm uninstall $release --wait || true
+          echo "Removing Helm releases (apps first)..."
+          echo "Keeping aws-load-balancer-controller until ELBv2 cleanup completes."
+
+          helm list -A -o json | jq -r '.[] | [.name, .namespace] | @tsv' | while IFS=$'\t' read -r name ns; do
+            if [ -z "$name" ] || [ -z "$ns" ]; then
+              continue
+            fi
+
+            if [ "$name" = "aws-load-balancer-controller" ] && [ "$ns" = "kube-system" ]; then
+              echo "Skipping (delete last): $name -n $ns"
+              continue
+            fi
+
+            echo "Deleting: $name -n $ns"
+            helm uninstall "$name" -n "$ns" --wait --timeout 10m || true
           done
-          echo "Helm releases removed"
+
+          echo "Helm releases removed (apps first)"
         continue-on-error: true
       
       # Remove o add-on do CloudWatch Application Signals antes de deletar o cluster
@@ -120,36 +132,71 @@ jobs:
           echo "CloudWatch add-on removed"
         continue-on-error: true
       
-      # Força a deleção de ALBs que podem ter sido criados pelas aplicações
-      # O sleep de 60s dá tempo para o controller processar a remoção dos Ingress
-      - name: Delete Load Balancers
+      # Cleanup de ELBv2 por tag (nao por nome)
+      # Motivo: nomes k8s-* nao sao confiaveis e podem nao conter o CLUSTER_NAME (ex: k8s-agrotech-...)
+      - name: Cleanup ELBv2 Resources (tagged to cluster)
         run: |
-          echo "Waiting for ALBs to be deleted..."
+          REGION="${{ env.AWS_REGION }}"
+          CLUSTER="${{ env.CLUSTER_NAME }}"
+
+          echo "Waiting for AWS Load Balancer Controller to process Ingress deletions..."
           sleep 60
-          
-          # Busca e deleta ALBs criados pelo cluster (começam com k8s-<cluster>)
-          aws elbv2 describe-load-balancers --region ${{ env.AWS_REGION }} --query "LoadBalancers[?contains(LoadBalancerName, 'k8s-${{ env.CLUSTER_NAME }}')].LoadBalancerArn" --output text | while read lb_arn; do
-            if [ ! -z "$lb_arn" ]; then
-              echo "Force deleting: $lb_arn"
-              aws elbv2 delete-load-balancer --load-balancer-arn $lb_arn --region ${{ env.AWS_REGION }} || true
-            fi
-          done
-          
-          echo "Load balancers cleaned up"
+
+          echo "Cleaning up ELBv2 resources tagged with elbv2.k8s.aws/cluster=${CLUSTER}..."
+
+          LB_ARNS=$(aws resourcegroupstaggingapi get-resources \
+            --region "$REGION" \
+            --tag-filters Key=elbv2.k8s.aws/cluster,Values="$CLUSTER" \
+            --resource-type-filters elasticloadbalancing:loadbalancer \
+            --query 'ResourceTagMappingList[].ResourceARN' \
+            --output text 2>/dev/null || true)
+
+          if [ -n "$LB_ARNS" ]; then
+            echo "Deleting load balancers..."
+            for arn in $LB_ARNS; do
+              echo "Deleting LB: $arn"
+              aws elbv2 delete-load-balancer --region "$REGION" --load-balancer-arn "$arn" || true
+            done
+
+            echo "Waiting for load balancers to be deleted..."
+            aws elbv2 wait load-balancers-deleted --region "$REGION" --load-balancer-arns $LB_ARNS || true
+          else
+            echo "No tagged load balancers found."
+          fi
+
+          echo "Sleeping 20s for propagation..."
+          sleep 20
+
+          TG_ARNS=$(aws resourcegroupstaggingapi get-resources \
+            --region "$REGION" \
+            --tag-filters Key=elbv2.k8s.aws/cluster,Values="$CLUSTER" \
+            --resource-type-filters elasticloadbalancing:targetgroup \
+            --query 'ResourceTagMappingList[].ResourceARN' \
+            --output text 2>/dev/null || true)
+
+          if [ -n "$TG_ARNS" ]; then
+            echo "Deleting target groups..."
+            for arn in $TG_ARNS; do
+              echo "Deleting TG: $arn"
+              aws elbv2 delete-target-group --region "$REGION" --target-group-arn "$arn" || true
+            done
+          else
+            echo "No tagged target groups found."
+          fi
+
+          echo "ELBv2 cleanup complete"
         continue-on-error: true
-      
-      # Target Groups são os grupos de destino do ALB (pods do Kubernetes)
-      # Devem ser deletados antes do cluster para evitar recursos órfãos
-      - name: Delete Target Groups
+
+      - name: Remove AWS Load Balancer Controller (last)
         run: |
-          echo "Cleaning up target groups..."
-          aws elbv2 describe-target-groups --region ${{ env.AWS_REGION }} --query "TargetGroups[?contains(TargetGroupName, 'k8s-${{ env.CLUSTER_NAME }}')].TargetGroupArn" --output text | while read tg_arn; do
-            if [ ! -z "$tg_arn" ]; then
-              echo "Deleting: $tg_arn"
-              aws elbv2 delete-target-group --target-group-arn $tg_arn --region ${{ env.AWS_REGION }} || true
-            fi
-          done
-          echo "Target groups cleaned up"
+          echo "Removing aws-load-balancer-controller (last)..."
+
+          if helm status aws-load-balancer-controller -n kube-system >/dev/null 2>&1; then
+            helm uninstall aws-load-balancer-controller -n kube-system --wait --timeout 10m || true
+            echo "aws-load-balancer-controller removed"
+          else
+            echo "aws-load-balancer-controller release not found, skipping"
+          fi
         continue-on-error: true
 
       - name: Delete EKS Nodegroups
@@ -164,13 +211,23 @@ jobs:
               echo "No nodegroups found for cluster ${{ env.CLUSTER_NAME }}."
             else
               for NG in $NODEGROUPS; do
-                echo "Deleting nodegroup: $NG"
-                eksctl delete nodegroup --cluster ${{ env.CLUSTER_NAME }} --name "$NG" --region ${{ env.AWS_REGION }} --wait
+                echo "Deleting nodegroup: $NG (--drain=false)"
+
+                set +e
+                eksctl delete nodegroup --cluster ${{ env.CLUSTER_NAME }} --name "$NG" --region ${{ env.AWS_REGION }} --wait --drain=false
+                RC=$?
+                set -e
+
+                if [ $RC -ne 0 ]; then
+                  echo "eksctl delete nodegroup failed. Falling back to AWS API delete-nodegroup..."
+                  aws eks delete-nodegroup --cluster-name ${{ env.CLUSTER_NAME }} --nodegroup-name "$NG" --region ${{ env.AWS_REGION }} || true
+                  aws eks wait nodegroup-deleted --cluster-name ${{ env.CLUSTER_NAME }} --nodegroup-name "$NG" --region ${{ env.AWS_REGION }} || true
+                fi
               done
               echo "All nodegroups deleted successfully."
             fi
           else
-            echo "Cluster $EKS_CLUSTER does not exist. Nothing to delete."
+            echo "Cluster ${{ env.CLUSTER_NAME }} does not exist. Nothing to delete."
           fi        
 
       # Deleta o cluster EKS completamente
