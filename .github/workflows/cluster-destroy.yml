@@ -110,7 +110,7 @@ jobs:
             fi
 
             echo "Deleting: $name -n $ns"
-            helm uninstall "$name" -n "$ns" --wait --timeout 10m || true
+            timeout 120s helm uninstall "$name" -n "$ns" --no-hooks || true
           done
 
           echo "Helm releases removed (apps first)"
